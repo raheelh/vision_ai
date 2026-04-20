@@ -1,0 +1,21 @@
+[property]
+gpu-id=0
+net-scale-factor=0.0039215697906911373
+offsets=127.5;127.5;127.5
+model-color-format=0
+onnx-file=models/face_detector_resnet50.onnx
+infer-dims=3;640;640
+batch-size=1
+network-mode=2
+num-detected-classes=1
+output-blob-names=output
+interval=0
+gie-unique-id=1
+classifier-threshold=0.4
+parser-plugin-file=nvdsinfer_custom_parser.so
+parse-bbox-func-name=nvdsinfer_custom_bbox_parser
+
+# Sample config for a public RetinaFace-style ONNX model.
+# Replace `onnx-file` with your face detector model file and
+# update `infer-dims`, `output-blob-names`, and parser settings
+# to match the model's export format.
