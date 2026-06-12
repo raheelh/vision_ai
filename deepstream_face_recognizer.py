@@ -28,6 +28,8 @@ class DeepStreamFaceRecognizer:
         camera_index: int = 0,
         preview_width: int = 1280,
         preview_height: int = 720,
+        max_track_distance: float = 120.0,
+        max_missed_frames: int = 15,
     ):
         self.detector_config = detector_config
         self.face_embedder = face_embedder
@@ -35,6 +37,11 @@ class DeepStreamFaceRecognizer:
         self.camera_index = camera_index
         self.preview_width = preview_width
         self.preview_height = preview_height
+
+        self.tracks = {}
+        self.next_track_id = 1
+        self.max_track_distance = max_track_distance
+        self.max_missed_frames = max_missed_frames
 
         Gst.init(None)
         self.pipeline = self._build_pipeline()
@@ -84,6 +91,13 @@ class DeepStreamFaceRecognizer:
         pgie = Gst.ElementFactory.make("nvinfer", "primary-inference")
         pgie.set_property("config-file-path", self.detector_config)
 
+        tracker = None
+        if self.enable_nvtracker:
+            tracker = Gst.ElementFactory.make("nvtracker", "tracker")
+            if not tracker:
+                raise RuntimeError("Could not create nvtracker element. Ensure DeepStream nvtracker is available.")
+            tracker.set_property("config-file-path", self.tracker_config)
+
         nvvidconv2 = Gst.ElementFactory.make("nvvideoconvert", "nvvidconv2")
         osd = Gst.ElementFactory.make("nvdsosd", "nv-onscreendisplay")
         sink = Gst.ElementFactory.make("nveglglessink", "video-renderer")
@@ -105,7 +119,11 @@ class DeepStreamFaceRecognizer:
         appsink.set_property("drop", True)
         appsink.set_property("caps", caps_bgr.get_property("caps"))
 
-        for element in [source, convert_src, capsfilter, tee, queue_infer, queue_cpu, nvvidconv, caps_nv12, streammux, pgie, nvvidconv2, osd, sink, convert_cpu, caps_bgr, appsink]:
+        elements = [source, convert_src, capsfilter, tee, queue_infer, queue_cpu, nvvidconv, caps_nv12, streammux, pgie]
+        if tracker is not None:
+            elements.append(tracker)
+        elements.extend([nvvidconv2, osd, sink, convert_cpu, caps_bgr, appsink])
+        for element in elements:
             if not element:
                 raise RuntimeError("Failed to create one of the required GStreamer elements")
             pipeline.add(element)
@@ -135,8 +153,14 @@ class DeepStreamFaceRecognizer:
 
         if not Gst.Element.link(streammux, pgie):
             raise RuntimeError("Failed to link streammux -> pgie")
-        if not Gst.Element.link(pgie, nvvidconv2):
-            raise RuntimeError("Failed to link pgie -> nvvidconv2")
+        if tracker is not None:
+            if not Gst.Element.link(pgie, tracker):
+                raise RuntimeError("Failed to link pgie -> tracker")
+            if not Gst.Element.link(tracker, nvvidconv2):
+                raise RuntimeError("Failed to link tracker -> nvvidconv2")
+        else:
+            if not Gst.Element.link(pgie, nvvidconv2):
+                raise RuntimeError("Failed to link pgie -> nvvidconv2")
         if not Gst.Element.link(nvvidconv2, osd):
             raise RuntimeError("Failed to link nvvidconv2 -> osd")
         if not Gst.Element.link(osd, sink):
@@ -206,17 +230,52 @@ class DeepStreamFaceRecognizer:
                 frame_meta = pyds.glist_next(frame_meta)
                 continue
 
-            obj_meta = pyds.glist_first(frame_meta.obj_meta_list)
-            while obj_meta:
-                obj_meta = pyds.NvDsObjectMeta.cast(obj_meta.data)
-                self._process_detection(obj_meta, frame)
-                obj_meta = pyds.glist_next(obj_meta)
+            detections = []
+            obj_meta_ptr = pyds.glist_first(frame_meta.obj_meta_list)
+            while obj_meta_ptr:
+                obj_meta = pyds.NvDsObjectMeta.cast(obj_meta_ptr.data)
+                left = int(max(obj_meta.rect_params.left, 0))
+                top = int(max(obj_meta.rect_params.top, 0))
+                width = int(obj_meta.rect_params.width)
+                height = int(obj_meta.rect_params.height)
+                right = min(left + width, frame.shape[1])
+                bottom = min(top + height, frame.shape[0])
+
+                if right > left and bottom > top:
+                    track_id = None
+                    if self.enable_nvtracker and getattr(obj_meta, "object_id", None) is not None:
+                        try:
+                            track_id = int(obj_meta.object_id)
+                        except Exception:
+                            track_id = None
+
+                    detections.append(
+                        {
+                            "obj_meta": obj_meta,
+                            "left": left,
+                            "top": top,
+                            "right": right,
+                            "bottom": bottom,
+                            "track_id": track_id,
+                        }
+                    )
+
+                obj_meta_ptr = pyds.glist_next(obj_meta_ptr)
+
+            if not self.enable_nvtracker:
+                self._assign_track_ids(detections)
+            for detection in detections:
+                self._process_detection(
+                    detection["obj_meta"],
+                    frame,
+                    track_id=detection.get("track_id"),
+                )
 
             frame_meta = pyds.glist_next(frame_meta)
 
         return Gst.PadProbeReturn.OK
 
-    def _process_detection(self, obj_meta, frame):
+    def _process_detection(self, obj_meta, frame, track_id=None):
         left = int(max(obj_meta.rect_params.left, 0))
         top = int(max(obj_meta.rect_params.top, 0))
         width = int(obj_meta.rect_params.width)
@@ -244,7 +303,13 @@ class DeepStreamFaceRecognizer:
             self.face_db.update_person(person_id, embedding)
             label = f"Person {person_id}"
 
-        obj_meta.object_id = int(person_id)
+        if track_id is not None:
+            label = f"T{track_id}: {label}"
+            try:
+                obj_meta.object_id = int(track_id)
+            except Exception:
+                pass
+
         self._annotate_object(obj_meta, label, left, top)
 
     def _annotate_object(self, obj_meta, label: str, left: int, top: int):
@@ -259,6 +324,65 @@ class DeepStreamFaceRecognizer:
             self._set_color(obj_meta.rect_params.border_color, (0.0, 1.0, 0.0, 1.0))
         except Exception:
             pass
+
+    def _assign_track_ids(self, detections):
+        if len(self.tracks) == 0:
+            for detection in detections:
+                detection["track_id"] = self.next_track_id
+                self.tracks[self.next_track_id] = {
+                    "left": detection["left"],
+                    "top": detection["top"],
+                    "right": detection["right"],
+                    "bottom": detection["bottom"],
+                    "missed": 0,
+                }
+                self.next_track_id += 1
+            return
+
+        assigned = set()
+        for detection in detections:
+            best_track_id = None
+            best_distance = float("inf")
+            cx = (detection["left"] + detection["right"]) / 2.0
+            cy = (detection["top"] + detection["bottom"]) / 2.0
+            for track_id, track in self.tracks.items():
+                if track_id in assigned:
+                    continue
+                tx = (track["left"] + track["right"]) / 2.0
+                ty = (track["top"] + track["bottom"]) / 2.0
+                distance = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5
+                if distance < best_distance:
+                    best_distance = distance
+                    best_track_id = track_id
+
+            if best_track_id is not None and best_distance <= self.max_track_distance:
+                detection["track_id"] = best_track_id
+                assigned.add(best_track_id)
+                self.tracks[best_track_id].update(
+                    {
+                        "left": detection["left"],
+                        "top": detection["top"],
+                        "right": detection["right"],
+                        "bottom": detection["bottom"],
+                        "missed": 0,
+                    }
+                )
+            else:
+                detection["track_id"] = self.next_track_id
+                self.tracks[self.next_track_id] = {
+                    "left": detection["left"],
+                    "top": detection["top"],
+                    "right": detection["right"],
+                    "bottom": detection["bottom"],
+                    "missed": 0,
+                }
+                self.next_track_id += 1
+
+        for track_id in list(self.tracks.keys()):
+            if track_id not in assigned:
+                self.tracks[track_id]["missed"] += 1
+                if self.tracks[track_id]["missed"] > self.max_missed_frames:
+                    del self.tracks[track_id]
 
     def _set_color(self, color_obj, rgba):
         try:

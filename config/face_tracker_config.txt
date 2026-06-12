@@ -1,0 +1,13 @@
+# DeepStream nvtracker configuration placeholder
+# Update the ll-lib-file and ll-config-file paths for your DeepStream installation.
+
+[property]
+gpu-id=0
+tracker-width=640
+tracker-height=384
+enable-batch-process=0
+ll-lib-file=/opt/nvidia/deepstream/deepstream/lib/libnvds_nvdcf_tracker.so
+ll-config-file=config/face_tracker_config_ll.txt
+
+# Replace the above values with the correct tracker library and config file for your platform.
+# On Windows, update the path to the tracker shared library accordingly.

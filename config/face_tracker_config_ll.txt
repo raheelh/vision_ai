@@ -1,0 +1,9 @@
+# Example low-level tracker config for nvtracker
+# Replace or adapt this config for your DeepStream tracker library.
+
+[dscfg]
+max_cosine_distance=0.7
+nn_budget=100
+
+# This file is a placeholder for the low-level tracker used by nvtracker.
+# Use a valid DeepStream nvtracker configuration for your chosen tracker implementation.

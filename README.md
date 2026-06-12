@@ -60,3 +60,4 @@ Use `python setup_config.py --force --create-model-placeholders` to overwrite ex
 - Example model names: `models/face_detector_resnet50.onnx` and `models/face_recognizer.onnx`.
 - The first unknown face detected is added to the local ChromaDB store.
 - The app retains only the best 5 saved vectors per person to keep matching performance stable.
+- Faces are tracked across frames using a lightweight motion-based tracker, and each track receives a `T<ID>` label prefix.
